@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+jobs/
+examples/cast/
+*.mp4
+*.part
+.DS_Store
