@@ -7,3 +7,4 @@ examples/cast/
 *.mp4
 *.part
 .DS_Store
+!docs/media/*.mp4
