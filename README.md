@@ -11,9 +11,11 @@ python mvswap.py run jobs/apt --source mv.mp4 --start 0 --end 97 \
 
 ## 效果
 
-左边是原片（原作者的脸打了码），右边是换人后的成片。一条 9 秒的 1080p 单人舞蹈，用这个仓库的代码一次过审，生成 ¥0.29、超分 ¥0.18，21 分钟出片。点图看原视频（有声）。
+左边是原片（原作者的脸打了码），右边是换人后的成片。一条 9 秒的 1080p 单人舞蹈，用这个仓库的代码一次过审，生成 ¥0.29、超分 ¥0.18，21 分钟出片。动图没有声音，下面可以下载有声原视频。
 
-[![左边原片，右边换人后的成片](docs/media/swap-compare.gif)](docs/media/swap-compare.mp4)
+![左边原片，右边换人后的成片](docs/media/swap-compare.gif)
+
+有声原视频：[下载 mp4](docs/media/swap-compare.mp4?raw=true)
 
 ## 准备
 
