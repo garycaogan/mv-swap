@@ -1,6 +1,6 @@
 # mv-swap：一键 AI 换人翻拍
 
-给一条高清原片（MV、舞蹈、影视片段）和几张角色图，说清楚「原片里的谁换成哪张图里的人」，它自己切镜头、认人、在 RunningHub 上用 MiniMax H3 换人生成、审片、重跑、超分、拼片，出成片、上下对照片和一份成本报告。
+给一条高清原片（MV、舞蹈、影视片段）和几张角色图，说清楚「原片里的谁换成哪张图里的人」，它自己切镜头、认人、在 RunningHub 上用 MiniMax H3 换人生成、审片、重跑、超分、拼片，出成片、对照片和一份成本报告。
 
 做法来自我们在 RunningHub 上做的几条换人片：15 秒的闺蜜手势舞、97 秒的《APT.》MV、18 秒的饭撒摇接力。踩过的坑都写进了代码，下面「它怎么做」一节一条条讲。
 
@@ -19,7 +19,7 @@ python mvswap.py run jobs/apt --source mv.mp4 --start 0 --end 97 \
 
 ## 准备
 
-1. **Python 3.10+、ffmpeg**（`brew install ffmpeg` / `apt install ffmpeg`），然后 `pip install -r requirements.txt`。想直接贴视频链接的话再装 `yt-dlp`。
+1. **Python 3.10+、ffmpeg 5.1 以上**（`brew install ffmpeg` / `apt install ffmpeg`；Ubuntu 22.04 自带的 4.4 太老），然后 `pip install -r requirements.txt`。想直接贴视频链接的话再装 `yt-dlp`。
 2. **两个 key**，复制 `.env.example` 成 `.env` 填上：
    - `RUNNINGHUB_API_KEY`：[RunningHub](https://www.runninghub.cn) 控制台「API 调用」里拿。会员 key 一次跑 5 个任务、扣 RH 币；企业 key 扣钱包、能同时跑很多个，`RUNNINGHUB_CONCURRENCY` 开大。几个 key 用逗号隔开会一起用。
    - `APIMART_API_KEY`：[APIMart](https://apimart.ai)，认人和审片用它的 Gemini 3.8 Flash，平面图形镜头重画用 GPT Image 2.5。想换别家视觉模型，配 `VISION_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL`（OpenAI 兼容接口都行）。
@@ -37,16 +37,16 @@ python mvswap.py run jobs/apt --source mv.mp4 --start 0 --end 97 \
 
 ```bash
 python mvswap.py run jobs/<任务名> --source <文件或链接> --cast "原片里的人=角色图" [--cast …] [--start 秒 --end 秒]
-python mvswap.py run jobs/<任务名>        # 断了就原样再跑：参数记在任务目录的 state.json 里，跑过的不重跑，在跑的接着查
+python mvswap.py run jobs/<任务名>        # 断了就原样再跑：参数记在任务目录的 state.json 里，跑过的不重跑，付过费的视觉模型结果不再调，提交过的生成和超分任务接着查
 python mvswap.py status jobs/<任务名>     # 到哪一步、每个镜头的情况、花了多少
 python mvswap.py assemble jobs/<任务名>   # 只重新拼片和出报告
 ```
 
 `--cast` 左边是原片里的人，用中文描述到能认出来就行，写**整条片里都不变**的特征（发色、演出服），别写会变的（发型长短、扎没扎起来）：这句会变成每个镜头里找人的依据。我们有一次写了「黑色短发」，到了这个人扎起头发的后台镜头，模型就去换了旁边一个短发戴眼镜的工作人员。同性别替换最稳，男换女、女换男时报告里会提醒。
 
-其他开关：`--crop auto|none|w:h:x:y`（默认自动裁掉上下黑边）、`--no-upscale`（不做超分）、`--max-attempts 3`、`--allow-many-graphic`。
+其他开关：`--crop auto|none|w:h:x:y`（默认自动裁掉上下黑边）、`--no-upscale`（不做超分）、`--max-attempts 3`、`--allow-many-graphic`、`--accept-failed`（看过对照片后接受没过审的镜头，继续付费超分）。
 
-跑完看任务目录里的 `report.md`、`final/compare.mp4`（上原片下成片）和 `final/sheet.jpg`（成片每秒一帧）。报告里「三次都没过审」的镜头要人看一眼：审片模型偏严，多数能用；真不能用的手工修，改完 `state.json` 再跑一次 `run`，它会补超分、重拼。
+跑完看任务目录里的 `report.md`、`final/compare.mp4`（竖屏左原片右成片，横屏和方形上原片下成片）和 `final/sheet.jpg`（成片每秒一帧）。只要有镜头所有版本都没过审，工具就跳过付费超分，先在本地免费拼诊断片和对照片，报告里逐个列出镜头和原因；没有可用版本的镜头在诊断片里暂用原片。审片模型偏严，多数能用：看过对照片觉得行，运行 `python mvswap.py run jobs/<任务名> --accept-failed` 接着超分，不会为这次确认多生成版本，确认会记在任务里，之后断了续跑也算数。真不能用的手工修，改完 `state.json` 再跑一次 `run` 会重拼；改过的镜头审片记录还是没过的，加 `--accept-failed` 才会补超分。加了 `--no-upscale` 的任务没有付费超分，不会停下来等确认。
 
 ## 它怎么做
 
@@ -62,7 +62,7 @@ python mvswap.py assemble jobs/<任务名>   # 只重新拼片和出报告
 5. **审片**：一道颜色检查（画面外圈和原片差太多 = 背景跑了），一道视觉模型对照原片同一时刻的三帧：景别、换对了没有、原来的人还在不在、多没多人、加没加字和贴纸、有没有崩。全都干净才算过。
 6. **重跑**：没过的换种子再来；最好的一次只换掉了一部分人时，下一次拿这次的结果当原片，只给没换掉的人再过一遍。最多 3 次，挑分最高的。
 7. **图形镜头**：视频模型做不了平面图形，就用 GPT Image 把中间那帧按原来的风格重画成新角色，再慢慢推近撑满时长。
-8. **超分**：过审的镜头在 RunningHub 上过一遍 SeedVR2，短边放大到成片尺寸，再按原镜头的颜色校一次（放大后整体偏品红）。
+8. **超分**：全部换人镜头都有过审版本（或者你加了 `--accept-failed`）之后，在 RunningHub 上过一遍 SeedVR2，短边放大到成片尺寸，再按原镜头的颜色校一次（放大后整体偏品红）。任务号一提交就记进 `state.json`，断了原样再跑先收原任务。
 9. **拼片**：每个镜头按原片的帧数取用，放大到长边 1920，原声配回去，出成片、对照片、缩略图和报告。
 
 ## 成本和时间（实测）

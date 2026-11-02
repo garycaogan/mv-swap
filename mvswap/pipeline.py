@@ -3,6 +3,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import RLock
 
 from . import cast as cast_mod
 from . import ai, config, finish, media, prompts, rh, vision
@@ -15,12 +16,15 @@ class Job:
         self.state_file = self.dir / "state.json"
         self.state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
         self._vision_base = self.state.get("vision_cny", 0.0)   # earlier runs of this job; this run's spend is added on save
+        self._vision_start = ai.vision_spent()
+        self._lock = RLock()
 
     def save(self):
-        self.state["vision_cny"] = round(self._vision_base + ai.vision_spent(), 3)
-        tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
-        tmp.replace(self.state_file)
+        with self._lock:
+            self.state["vision_cny"] = round(self._vision_base + ai.vision_spent() - self._vision_start, 3)
+            tmp = self.state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
+            tmp.replace(self.state_file)
 
     def log(self, event: str, **f):
         line = {"at": time.strftime("%H:%M:%S"), "event": event, **f}
@@ -71,22 +75,45 @@ def _keys(job: Job, shot: dict, video: Path, offset: int, tag: str) -> list[Path
 
 
 def stage_cast(job: Job, specs: list[str]):
-    if job.state.get("cast") and all(c.get("src_desc") for c in job.state["cast"]):
-        return
-    cast = cast_mod.parse(specs, job.dir / "refs")
-    cast_mod.describe(cast)
-    shots = job.state["shots"]
-    pick = [shots[int(i * (len(shots) - 1) / 7)] for i in range(min(8, len(shots)))]
-    frames = []
-    for s in pick:
-        ks = _keys(job, s, Path(job.state["prepared"]["mv"]), s["f0"], "src")
-        frames.append(ks[len(ks) // 2])
-    job.state["style"] = vision.performers(cast, frames)
-    job.log("style", kind=job.state["style"]["kind"], desc=job.state["style"]["desc"])
-    job.state["cast"] = cast
-    for c in cast:
-        job.log("cast", id=c["id"], source=c["src_desc"], becomes=c["name"], gender=f"{c.get('src_gender')}->{c.get('gender')}")
-    job.save()
+    try:
+        if not job.state.get("cast"):
+            job.state["cast"] = cast_mod.parse(specs, job.dir / "refs")
+            job.save()
+        cast = job.state["cast"]
+        for c in cast:
+            if not c.get("desc"):
+                cast_mod.describe([c])
+                job.save()                                     # each paid description survives the next call failing
+        missing = [c for c in cast if not c.get("src_desc")]
+        if missing:
+            shots = job.state["shots"]
+            pick = [shots[int(i * (len(shots) - 1) / 7)] for i in range(min(8, len(shots)))]
+            frames = []
+            for s in pick:
+                ks = _keys(job, s, Path(job.state["prepared"]["mv"]), s["f0"], "src")
+                frames.append(ks[len(ks) // 2])
+            job.state["style"] = vision.performers(missing, frames)
+            job.save()
+            job.log("style", kind=job.state["style"]["kind"], desc=job.state["style"]["desc"])
+            for c in cast:
+                job.log("cast", id=c["id"], source=c["src_desc"], becomes=c["name"], gender=f"{c.get('src_gender')}->{c.get('gender')}")
+    finally:
+        job.save()                                             # also record billed calls whose replies could not be parsed
+
+
+def _vision_batch(job: Job, todo: list, call, record, workers: int):
+    """Checkpoint each finished call in its worker; another slow/failed call must not hide its result."""
+    def one(item):
+        try:
+            result = call(item)
+            with job._lock:
+                record(item, result)
+                job.save()
+        finally:
+            job.save()
+
+    with ThreadPoolExecutor(workers) as pool:
+        list(pool.map(one, todo))
 
 
 def stage_label(job: Job):
@@ -96,22 +123,21 @@ def stage_label(job: Job):
     mv = Path(job.state["prepared"]["mv"])
 
     def one(s):
-        return s, vision.label_shot(job.state["cast"], _keys(job, s, mv, s["f0"], "src"), job.state.get("style"))
-    with ThreadPoolExecutor(10) as pool:
-        for s, lab in pool.map(one, todo):
-            s.update(lab)
-            job.log("label", shot=s["id"], kind=s["kind"], people=",".join(s["people"]), framing=s["framing"])
-            job.save()
+        return vision.label_shot(job.state["cast"], _keys(job, s, mv, s["f0"], "src"), job.state.get("style"))
+
+    def record(s, lab):
+        s.update(lab)
+        job.log("label", shot=s["id"], kind=s["kind"], people=",".join(s["people"]), framing=s["framing"])
+
+    _vision_batch(job, todo, one, record, 10)
 
 
 def stage_backdrops(job: Job):
     """Shots labelled before labels named the setting get it now (one small vision call each)."""
     mv = Path(job.state["prepared"]["mv"])
     todo = [s for s in job.state["shots"] if s.get("kind") == "swap" and "backdrop" not in s]
-    with ThreadPoolExecutor(10) as pool:
-        for s, bg in pool.map(lambda s: (s, vision.backdrop(_keys(job, s, mv, s["f0"], "src"))), todo):
-            s["backdrop"] = bg
-            job.save()
+    _vision_batch(job, todo, lambda s: vision.backdrop(_keys(job, s, mv, s["f0"], "src")),
+                  lambda s, bg: s.update(backdrop=bg), 10)
 
 
 def stage_graphic(job: Job, allow_many: bool = False):
@@ -154,19 +180,28 @@ def stage_generate(job: Job, max_attempts: int):
     (job.dir / "takes").mkdir(exist_ok=True)
     sched = None
     stage_review(job)                                           # a resume may hold finished takes nobody reviewed yet
-    for _ in range(max_attempts):
-        todo = [s for s in job.state["shots"] if s["kind"] == "swap"
+
+    def unfinished(a):
+        return a["status"] in ("pending", "submitted")
+
+    while True:
+        # Collect paid remote tasks before considering any new submissions, even at/above the attempt limit.
+        collecting = [s for s in job.state["shots"] if s["kind"] == "swap"
+                      and any(unfinished(a) and a.get("task") for a in s.get("attempts", []))]
+        todo = collecting or [s for s in job.state["shots"] if s["kind"] == "swap"
                 and not any((a.get("review") or {}).get("pass") for a in s.get("attempts", []))
-                and len(s.get("attempts", [])) < max_attempts]
+                and (len(s.get("attempts", [])) < max_attempts
+                     or any(unfinished(a) and a["n"] <= max_attempts for a in s.get("attempts", [])))]
         if not todo:
             break
         takes = []
         for s in todo:
             clip = job.dir / "shots" / f"{s['id']}.mp4"
-            if not clip.exists():
-                media.cut_clip(mv, audio, s, size, clip)
             s.setdefault("attempts", [])
-            pending = next((a for a in s["attempts"] if a["status"] in ("pending", "submitted")), None)
+            pending = next((a for a in s["attempts"] if unfinished(a) and a.get("task")), None)
+            pending = pending or next((a for a in s["attempts"] if unfinished(a)), None)
+            if not (pending and pending.get("task")) and not clip.exists():
+                media.cut_clip(mv, audio, s, size, clip)
             if pending:                                         # a resume: run the attempt that never finished
                 a = pending
             else:
@@ -188,7 +223,7 @@ def stage_generate(job: Job, max_attempts: int):
                 s["attempts"].append(a)
             takes.append({"id": f"{s['id']}#{a['n']}", "video": a.get("video") or str(clip), "pictures": a["pictures"], "prompt": a["prompt"],
                           "seconds": s["gen_frames"] / config.FPS, "width": size[0], "height": size[1], "seed": a["seed"], "out": a["file"],
-                          **({"task": a["task"], "key": a["key"]} if a["status"] == "submitted" and a.get("task") else {})})
+                          **({"task": a["task"], "key": a["key"]} if a.get("task") else {})})
         job.save()
         job.log("round", takes=len(takes))
         by_take = {t["id"]: t for t in takes}
@@ -199,11 +234,15 @@ def stage_generate(job: Job, max_attempts: int):
             a = next(x for x in s["attempts"] if x["n"] == int(n))
             a["status"] = {"submitted": "submitted", "done": "done", "failed": "failed"}[event]
             a.update({k: v for k, v in info.items() if k in ("key", "task", "run_s", "cny", "error")})
-            job.log(event, take=tid, **{k: v for k, v in info.items() if k in ("key", "run_s", "cny", "error")})
             job.save()
+            job.log(event, take=tid, **{k: v for k, v in info.items() if k in ("key", "run_s", "cny", "error")})
 
         sched = sched or rh.Scheduler(job.log)
-        sched.run(list(by_take.values()), on_event)
+        _known_keys(sched, by_take.values())
+        try:
+            sched.run(list(by_take.values()), on_event)
+        finally:
+            job.save()
         stage_review(job)
     for s in job.state["shots"]:
         if s["kind"] != "swap":
@@ -236,35 +275,71 @@ def stage_upscale(job: Job):
     d = job.dir / "upscale"
     d.mkdir(exist_ok=True)
     takes = []
+
+    def complete(s, up):
+        src, out = d / f"{s['id']}-in.mp4", Path(up["out"])
+        got = media.frame_count(out)
+        if got < s["frames"]:                                   # a short output would pull the picture off the music
+            up["failed"] = f"超分只出了 {got}/{s['frames']} 帧，用没超分的版本"
+        else:
+            up["fix"] = _colour_fix(src, out)
+            up["file"] = str(out)
+        up["status"] = "done"
+        job.save()
+
     for s in job.state["shots"]:
         a = s["kind"] == "swap" and s.get("chosen") and next((x for x in s["attempts"] if x["n"] == s["chosen"]), None)
-        if not a or (s.get("upscaled") or {}).get("n") == a["n"]:
+        if not a:
             continue
+        up = s.get("upscaled") or {}
+        if up.get("n") == a["n"]:
+            if up.get("file") or up.get("failed") or up.get("status") in ("done", "failed"):
+                continue
+            if up.get("status") == "downloaded":
+                complete(s, up)                                 # local post-processing can fail after the paid result arrives
+                continue
+        else:
+            up = {"n": a["n"], "status": "pending", "out": str(d / f"{s['id']}-{a['n']}-up.mp4")}
+            s["upscaled"] = up
         src = d / f"{s['id']}-in.mp4"
-        media.ff("-i", a["file"], "-vf", f"trim=end_frame={s['frames']},setpts=N/{config.FPS}/TB", "-an", "-r", str(config.FPS),
-                 "-c:v", "libx264", "-crf", "12", "-preset", "fast", str(src))
+        if not up.get("task"):
+            media.ff("-i", a["file"], "-vf", f"trim=end_frame={s['frames']},setpts=N/{config.FPS}/TB", "-an", "-r", str(config.FPS),
+                     "-c:v", "libx264", "-crf", "12", "-preset", "fast", str(src))
         takes.append({"id": f"{s['id']}#{a['n']}", "video": str(src), "pictures": [], "upscale": min(fw, fh), "seconds": s["frames"] / config.FPS,
-                      "out": str(d / f"{s['id']}-{a['n']}-up.mp4")})
+                      "out": up["out"], **({"task": up["task"], "key": up["key"]} if up.get("task") else {})})
     if not takes:
         return
+    job.save()
     job.log("upscale", shots=len(takes))
 
     def on_event(tid, event, info):
         sid, n = tid.split("#")
         s = next(x for x in job.state["shots"] if x["id"] == sid)
+        up = s["upscaled"]
+        up.update({k: v for k, v in info.items() if k in ("key", "task", "run_s", "cny")})
+        up["status"] = event
+        if event == "failed":
+            up["failed"] = str(info.get("error"))[:200]
         if event == "done":
-            src, out = d / f"{sid}-in.mp4", d / f"{sid}-{n}-up.mp4"
-            got = media.frame_count(out)
-            if got < s["frames"]:                               # a short output would pull the picture off the music
-                s["upscaled"] = {"n": int(n), "failed": f"超分只出了 {got}/{s['frames']} 帧，用没超分的版本", "cny": info.get("cny", 0)}
-            else:
-                s["upscaled"] = {"n": int(n), "file": str(out), "cny": info.get("cny", 0), "run_s": info.get("run_s", 0),
-                                 "fix": _colour_fix(src, out)}
-        elif event == "failed":
-            s["upscaled"] = {"n": int(n), "failed": str(info.get("error"))[:200]}
+            up["status"] = "downloaded"
+        job.save()                                             # task/key and billing survive logging or colour-fix failures
+        if event == "done":
+            complete(s, up)
         job.log(f"upscale_{event}", take=tid, **{k: v for k, v in info.items() if k in ("run_s", "cny", "error")})
+    sched = rh.Scheduler(job.log)
+    _known_keys(sched, takes)
+    try:
+        sched.run(takes, on_event)
+    finally:
         job.save()
-    rh.Scheduler(job.log).run(takes, on_event)
+
+
+def _known_keys(sched, takes):
+    """A task submitted under a key that is no longer configured can't be polled; stop instead of resubmitting or spinning."""
+    lost = sorted({t["key"] for t in takes if t.get("task") and t.get("key") not in sched.keys})
+    if lost:
+        raise SystemExit(f"有已提交的 RunningHub 任务记在 {'、'.join(lost)} 名下（k1 是 RUNNINGHUB_API_KEY 里的第一个 key，依此类推），"
+                         "现在没有这个 key。把原来的 key 按原顺序配回去再跑，已经付过钱的任务会接着收")
 
 
 def stage_review(job: Job):
@@ -280,22 +355,32 @@ def stage_review(job: Job):
         if lost > max(2, s["frames"] // 10):
             rv["pass"] = False
             rv["issue"] = (rv.get("issue") or "") + f"（{lost} 帧背景和原片差太多）"
-        return s, a, rv
-    with ThreadPoolExecutor(6) as pool:
-        for s, a, rv in pool.map(one, todo):
-            a["review"] = rv
-            job.log("review", take=f"{s['id']}#{a['n']}", ok=rv["pass"], score=rv.get("score"), issue=rv.get("issue"))
-            job.save()
+        return rv
+
+    def record(sa, rv):
+        s, a = sa
+        a["review"] = rv
+        job.log("review", take=f"{s['id']}#{a['n']}", ok=rv["pass"], score=rv.get("score"), issue=rv.get("issue"))
+
+    _vision_batch(job, todo, one, record, 6)
 
 
 def run(out: Path, source: str | None, cast_specs: list[str], start: float = 0, end: float | None = None, allow_lowres: bool = False,
-        max_attempts: int = config.MAX_ATTEMPTS, crop: str = "auto", upscale: bool = True, allow_many_graphic: bool = False) -> dict:
+        max_attempts: int = config.MAX_ATTEMPTS, crop: str = "auto", upscale: bool = True, allow_many_graphic: bool = False,
+        accept_failed: bool = False) -> dict:
     job = Job(out)
     if not job.state.get("args"):
         if not source or not cast_specs:
             raise SystemExit("新任务要给 --source 和至少一个 --cast")
         job.state["args"] = {"source": source, "cast": cast_specs, "start": start, "end": end, "crop": crop, "upscale": upscale}
         job.save()
+    try:
+        return _run(job, allow_lowres, max_attempts, allow_many_graphic, accept_failed)
+    finally:
+        job.save()
+
+
+def _run(job: Job, allow_lowres: bool, max_attempts: int, allow_many_graphic: bool, accept_failed: bool) -> dict:
     a = job.state["args"]
     stage_prepare(job, a["source"], a["start"], a["end"], allow_lowres, a.get("crop", "auto"))
     stage_shots(job)
@@ -303,13 +388,24 @@ def run(out: Path, source: str | None, cast_specs: list[str], start: float = 0, 
     stage_label(job)
     stage_backdrops(job)
     stage_graphic(job, allow_many_graphic)
-    stage_generate(job, max_attempts)
-    if a.get("upscale", True):
+    # Keep an accepted diagnostic cut on resume, including an interruption during its paid upscale.
+    accepted = accept_failed or job.state.get("accept_failed", False)
+    resume_accepted = accepted and (job.state.get("review_blocked") or job.state.get("accept_failed"))
+    stage_generate(job, 0 if resume_accepted else max_attempts)
+    upscale = a.get("upscale", True)
+    flagged = finish.failed_shots(job.state)
+    # Only the paid upscale waits for a person; without it the cut is already final.
+    job.state["review_blocked"] = [s["id"] for s in flagged] if upscale and not accepted else []
+    job.state["accept_failed"] = bool(flagged and accepted)
+    job.save()
+    if upscale and not job.state["review_blocked"]:
         stage_upscale(job)
     res = finish.assemble(job.state, job.dir)
     job.state["t_done"] = time.time()
     job.state["final"] = res
     job.save()
     rep = finish.report(job.state, job.dir)
-    job.log("done", film=res["film"], frames=res["frames"], want=res["want"], report=str(rep))
+    job.log("diagnostic" if job.state["review_blocked"] else "done", film=res["film"], frames=res["frames"], want=res["want"], report=str(rep))
+    if job.state["review_blocked"]:
+        print("有镜头所有版本都没过审，已跳过付费超分。看过对照片觉得能用，再加 --accept-failed 重跑会接着超分。", flush=True)
     return res

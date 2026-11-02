@@ -198,7 +198,7 @@ def keyframes(video: Path, idxs: list[int], out_dir: Path, tag: str, width: int 
     out = []
     for i in idxs:
         p = out_dir / f"{tag}-{i}.jpg"
-        ff("-i", str(video), "-vf", f"select=eq(n\\,{i}),scale={width}:-2", "-vsync", "0", "-frames:v", "1", "-q:v", "3", str(p))
+        ff("-i", str(video), "-vf", f"select=eq(n\\,{i}),scale={width}:-2", "-fps_mode", "passthrough", "-frames:v", "1", "-q:v", "3", str(p))
         if p.exists():
             out.append(p)
     return out
@@ -207,6 +207,6 @@ def keyframes(video: Path, idxs: list[int], out_dir: Path, tag: str, width: int 
 def raw_frames(video: Path, n: int, w: int = 96, h: int = 54, start: int = 0):
     """Small RGB frames as a numpy array (n, h, w, 3) for colour checks."""
     import numpy as np
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(video), "-vf", f"select='gte(n,{start})',scale={w}:{h}", "-vsync", "0",
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(video), "-vf", f"select='gte(n,{start})',scale={w}:{h}", "-fps_mode", "passthrough",
                           "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
     return np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)

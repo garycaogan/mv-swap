@@ -101,6 +101,32 @@ def assemble(state: dict, job: Path) -> dict:
     return {"film": str(film), "compare": str(side), "sheet": str(sheet), "frames": media.frame_count(film), "want": prep["frames"]}
 
 
+def failed_shots(state: dict) -> list[dict]:
+    return [s for s in state.get("shots", []) if s["kind"] == "swap"
+            and not any((a.get("review") or {}).get("pass") for a in s.get("attempts", []))]
+
+
+def _failure_reason(a: dict) -> str:
+    rv = a.get("review") or {}
+    if rv.get("issue"):
+        return str(rv["issue"]).replace("\n", " ")
+    reasons = []
+    for key, label in (("originals_left", "原人物仍在"), ("extra_people", "多出人物"), ("added_overlays", "新增贴字或贴纸"), ("broken", "画面崩坏")):
+        if rv.get(key):
+            reasons.append(label)
+    if rv.get("right_people") is False or rv.get("missing"):
+        reasons.append("没有换对全部人物")
+    if rv.get("style_kept") is False:
+        reasons.append("画风改变")
+    if rv.get("framing") is not None and int(rv["framing"] or 0) < 1:
+        reasons.append("景别不符")
+    if rv.get("score") is not None and float(rv["score"] or 0) < 6:
+        reasons.append("评分低于 6")
+    if rv.get("backdrop_lost_frames"):
+        reasons.append(f"背景偏离 {rv['backdrop_lost_frames']} 帧")
+    return "；".join(reasons) or str(a.get("error") or "未取得可用的过审结果").replace("\n", " ")
+
+
 def report(state: dict, job: Path) -> Path:
     shots = state["shots"]
     rh_cny = sum(a.get("cny", 0) for s in shots for a in s.get("attempts", []))
@@ -111,10 +137,11 @@ def report(state: dict, job: Path) -> Path:
     gpu += sum((s.get("upscaled") or {}).get("run_s", 0) for s in shots) / 60
     wall = (state.get("t_done") or time.time()) - state.get("t_start", time.time())
     kinds = {k: sum(1 for s in shots if s["kind"] == k) for k in ("swap", "keep", "graphic")}
-    flagged = [s for s in shots if s["kind"] == "swap" and not any(a.get("review", {}).get("pass") for a in s.get("attempts", []))]
+    flagged = failed_shots(state)
+    layout = "上原片下成片" if state["prepared"]["width"] >= state["prepared"]["height"] else "左原片右成片"
     lines = [
         f"# 换人成片报告：{job.name}", "",
-        f"成片 `final/film.mp4`，对照 `final/compare.mp4`（上原片下成片），逐秒缩略图 `final/sheet.jpg`。",
+        f"{'诊断用成片' if state.get('review_blocked') else '成片'} `final/film.mp4`，对照 `final/compare.mp4`（{layout}），逐秒缩略图 `final/sheet.jpg`。",
         f"原片 {state['prepared']['width']}×{state['prepared']['height']}，{state['prepared']['frames'] / config.FPS:.1f} 秒，"
         f"{len(shots)} 个镜头：换人 {kinds['swap']}、用原片 {kinds['keep']}、图形 {kinds['graphic']}。", "",
         f"花费：RunningHub 生成 ¥{rh_cny:.2f}（成片用到的 ¥{used:.2f}）、超分 ¥{up_cny:.2f}，图形镜头生图 ¥{graphic_cny:.2f}，"
@@ -125,7 +152,21 @@ def report(state: dict, job: Path) -> Path:
     if warn:
         lines += ["性别对不上的替换（男换女、女换男不稳，留意这些人的镜头）：" + "、".join(f"{c['hint']}→{c['name']}" for c in warn), ""]
     if flagged:
-        lines += [f"**{len(flagged)} 个镜头三次都没过审**，成片里用的是分数最高的那次，需要人看：" + "、".join(s["id"] for s in flagged), ""]
+        lines += [f"**{len(flagged)} 个镜头所有版本都没过审**，需要人看：" + "、".join(s["id"] for s in flagged),
+                  "片里用的是已完成版本中分数最高的那次；没有可用版本的镜头暂用原片。", ""]
+        if state.get("review_blocked"):
+            lines += ["已在付费超分前停下，只在本地免费拼了诊断片和对照片。",
+                      "看过对照片觉得能用，再加 `--accept-failed` 重跑会接着超分：",
+                      f'`python mvswap.py run "{job}" --accept-failed`', ""]
+        elif state.get("accept_failed"):
+            lines += ["本次已通过 `--accept-failed` 接受未过审镜头，继续超分；审片结果仍保留供核对。", ""]
+        for s in flagged:
+            lines.append(f"- {s['id']}（{len(s.get('attempts', []))} 个版本）：")
+            for a in s.get("attempts", []):
+                lines.append(f"  - 版本 {a['n']}：{_failure_reason(a)}")
+            if not s.get("attempts"):
+                lines.append("  - 没有生成结果，片里暂用原片。")
+        lines.append("")
     lines += ["| 镜头 | 秒 | 类型 | 谁 | 次数 | 采用 | 分 | 问题 |", "|---|---|---|---|---|---|---|---|"]
     for s in shots:
         ch = next((a for a in s.get("attempts", []) if a["n"] == s.get("chosen")), {})

@@ -8,6 +8,7 @@
     python mvswap.py assemble jobs/<任务名>   # 只重新拼片和出报告
 
 --cast 右边写一张角色图（全身、穿着成片里的衣服）。原片默认要 720p 以上，确认用低清就加 --allow-lowres。
+有镜头所有版本都没过审时，停在付费超分之前，先拼诊断片和对照片；看过觉得能用，加 --accept-failed 重跑接着超分。
 """
 import argparse
 import json
@@ -48,6 +49,7 @@ def main():
     r.add_argument("--crop", default="auto", help="auto（裁掉黑边）/ none / w:h:x:y")
     r.add_argument("--no-upscale", action="store_true", help="不做 SeedVR2 超分")
     r.add_argument("--allow-many-graphic", action="store_true", help="图形镜头超过两成也照做")
+    r.add_argument("--accept-failed", action="store_true", help="看过对照片后接受未过审镜头，继续付费超分")
     s = sub.add_parser("status")
     s.add_argument("job", type=Path)
     a = sub.add_parser("assemble")
@@ -55,7 +57,7 @@ def main():
     args = ap.parse_args()
     if args.cmd == "run":
         pipeline.run(args.job, args.source, args.cast, args.start, args.end, args.allow_lowres, args.max_attempts, args.crop,
-                     not args.no_upscale, args.allow_many_graphic)
+                     not args.no_upscale, args.allow_many_graphic, accept_failed=args.accept_failed)
     elif args.cmd == "status":
         status(args.job)
     else:
