@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 
 from . import cast as cast_mod
-from . import ai, config, finish, media, prompts, rh, vision
+from . import ai, config, finish, framing, media, prompts, references, rh, vision
 
 
 class Job:
@@ -62,6 +62,12 @@ def stage_shots(job: Job):
     sims = media.structure(Path(p["mv"]))
     max_frames = config.MAX_GEN_FRAMES - config.PAD_MIN - 16       # so gen_frames never passes MAX_GEN_FRAMES
     job.state["shots"] = media.find_shots(scores, p["frames"], max_frames, sims)
+    cap = job.state.get("args", {}).get("max_segment_seconds", 0)
+    if cap:
+        import numpy as np
+        raw = media.raw_frames(Path(p["mv"]), p["frames"]).astype(np.float32)
+        motion = [0.0] + np.abs(np.diff(raw, axis=0)).mean(axis=(1, 2, 3)).tolist()
+        job.state["shots"] = media.split_shots(job.state["shots"], min(max_frames, int(cap * config.FPS)), motion)
     job.log("shots", count=len(job.state["shots"]))
     job.save()
 
@@ -140,6 +146,28 @@ def stage_backdrops(job: Job):
                   lambda s, bg: s.update(backdrop=bg), 10)
 
 
+def stage_references(job: Job):
+    """Reuse source geometry; edit modes have checkpointed generation and image QA."""
+    mode = job.state.get("args", {}).get("ref_mode", "crop")
+    by = {c["id"]: c for c in job.state.get("cast", [])}
+    for s in job.state.get("shots", []):
+        if s.get("kind") != "swap" or s.get("references"):
+            continue
+        if any(not by[p].get("references") for p in s["people"]):
+            # Legacy jobs retain their paid inputs; new jobs always carry analyzed reference candidates.
+            continue
+        refs = {}
+        for person in s["people"]:
+            geometry = (s.get("geometry") or {}).get(person) or {"framing": s.get("framing")}
+            if mode == "crop":
+                refs[person] = framing.reference(by[person], geometry, job.dir / "refs" / f"{s['id']}-{person}-{framing.shot_size(geometry.get('framing'))}.jpg")
+            else:
+                refs[person] = references.prepare(job, s, by[person], geometry, mode)
+        s["references"] = refs
+        job.save()
+        job.log("references", shot=s["id"], pictures=",".join(r["picture"] for r in refs.values()))
+
+
 def stage_graphic(job: Job, allow_many: bool = False):
     shots = job.state["shots"]
     n = sum(1 for s in shots if s["kind"] == "graphic")
@@ -211,10 +239,12 @@ def stage_generate(job: Job, max_attempts: int):
                 done = [x for x in s["attempts"] if x["status"] == "done" and x.get("review")]
                 best = max(done, key=lambda x: float(x["review"].get("score") or 0), default=None)
                 missing = (best or {}).get("review", {}).get("missing") or []
-                half = best and missing and len(missing) < len(s["people"]) and int(best["review"].get("framing") or 0) >= 1 \
+                half = best and missing and not best["review"].get("drift_seconds") and not best["review"].get("unchecked_seconds") \
+                    and len(missing) < len(s["people"]) and int(best["review"].get("framing") or 0) >= 1 \
                     and not best["review"].get("broken") and not best["review"].get("extra_people")
                 who = missing if half else s["people"]
-                prompt, pics = prompts.build(job.state["cast"], who, text, second_pass=bool(half), others=bool(s.get("others")),
+                shot_cast = [{**c, **(s.get("references") or {}).get(c["id"], {})} for c in job.state["cast"]]
+                prompt, pics = prompts.build(shot_cast, who, text, second_pass=bool(half), others=bool(s.get("others")),
                                              style=job.state.get("style"), backdrop=s.get("backdrop", ""))
                 a = {"n": n, "seed": config.SEEDS[(n - 1) % len(config.SEEDS)], "status": "pending", "prompt": prompt, "pictures": pics,
                      "file": str(job.dir / "takes" / f"{s['id']}-{n}.mp4")}
@@ -350,7 +380,9 @@ def stage_review(job: Job):
         s, a = sa
         take = Path(a["file"])
         lost = _backdrop_lost(job, s, take)
-        rv = vision.review_take(job.state["cast"], s["people"], _keys(job, s, mv, s["f0"], "src"), _keys(job, s, take, 0, f"t{a['n']}"))
+        panels, seconds = framing.pairs(mv, take, s, job.dir / "review" / f"{s['id']}-{a['n']}", "seconds")
+        rv = vision.review_take(job.state["cast"], s["people"], panels, [], seconds=seconds)
+        rv["evidence"] = [str(p) for p in panels]
         rv["backdrop_lost_frames"] = lost
         if lost > max(2, s["frames"] // 10):
             rv["pass"] = False
@@ -367,26 +399,47 @@ def stage_review(job: Job):
 
 def run(out: Path, source: str | None, cast_specs: list[str], start: float = 0, end: float | None = None, allow_lowres: bool = False,
         max_attempts: int = config.MAX_ATTEMPTS, crop: str = "auto", upscale: bool = True, allow_many_graphic: bool = False,
-        accept_failed: bool = False) -> dict:
+        accept_failed: bool = False, max_segment_seconds: float = 0, ref_mode: str | None = None, refs_only: bool = False) -> dict:
+    import math
+    if not math.isfinite(max_segment_seconds) or (max_segment_seconds != 0 and max_segment_seconds < 1):
+        raise SystemExit("--max-segment-seconds 要为 0（关闭）或至少 1 秒")
+    if ref_mode is not None and ref_mode not in references.MODES:
+        raise SystemExit("--ref-mode 要为 crop、neutral 或 keyframe")
     job = Job(out)
     if not job.state.get("args"):
         if not source or not cast_specs:
             raise SystemExit("新任务要给 --source 和至少一个 --cast")
-        job.state["args"] = {"source": source, "cast": cast_specs, "start": start, "end": end, "crop": crop, "upscale": upscale}
+        job.state["args"] = {"source": source, "cast": cast_specs, "start": start, "end": end, "crop": crop, "upscale": upscale,
+                             "max_segment_seconds": max_segment_seconds, "ref_mode": ref_mode or config.DEFAULT_REF_MODE}
         job.save()
     try:
-        return _run(job, allow_lowres, max_attempts, allow_many_graphic, accept_failed)
+        return _run(job, allow_lowres, max_attempts, allow_many_graphic, accept_failed, refs_only)
     finally:
         job.save()
 
 
-def _run(job: Job, allow_lowres: bool, max_attempts: int, allow_many_graphic: bool, accept_failed: bool) -> dict:
+def _run(job: Job, allow_lowres: bool, max_attempts: int, allow_many_graphic: bool, accept_failed: bool, refs_only: bool = False) -> dict:
     a = job.state["args"]
     stage_prepare(job, a["source"], a["start"], a["end"], allow_lowres, a.get("crop", "auto"))
     stage_shots(job)
     stage_cast(job, a["cast"])
     stage_label(job)
     stage_backdrops(job)
+    try:
+        stage_references(job)
+    except RuntimeError as exc:
+        job.state["reference_blocked"] = str(exc)
+        job.state["t_reference_done"] = time.time()
+        job.save()
+        finish.report(job.state, job.dir)
+        raise SystemExit(str(exc)) from None
+    job.state.pop("reference_blocked", None)
+    if refs_only:
+        job.state["references_ready"] = True
+        job.state["t_reference_done"] = time.time()
+        job.save()
+        finish.report(job.state, job.dir)
+        return {"references_ready": True}
     stage_graphic(job, allow_many_graphic)
     # Keep an accepted diagnostic cut on resume, including an interruption during its paid upscale.
     accepted = accept_failed or job.state.get("accept_failed", False)

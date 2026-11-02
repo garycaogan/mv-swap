@@ -180,6 +180,32 @@ def target_size(width: int, height: int) -> tuple[int, int]:
     return w, h
 
 
+def split_shots(shots: list[dict], max_frames: int, motion: list[float]) -> list[dict]:
+    """Preserve real cuts; choose low-motion pauses near balanced boundaries inside long shots."""
+    if max_frames < config.FPS:
+        raise ValueError("每段最长秒数至少为 1 秒")
+    out = []
+    for shot in shots:
+        start, end = shot["f0"], shot["f0"] + shot["frames"]
+        first = True
+        while start < end:
+            count = math.ceil((end - start) / max_frames)
+            target = start + (end - start) // count
+            if count == 1:
+                stop = end
+            else:
+                lo = max(start + 1, target - config.FPS // 2, end - (count - 1) * max_frames)
+                hi = min(start + max_frames, target + config.FPS // 2, end - 1)
+                stop = min(range(lo, hi + 1), key=lambda f: (motion[f] if f < len(motion) else float("inf"), abs(f-target)))
+            out.append({"f0": start, "frames": stop-start, "gen_frames": gen_frames(stop-start),
+                        "joined": shot.get("joined", False) if first else True,
+                        "split_reason": "source-cut" if first else "source-motion-pause"})
+            start, first = stop, False
+    for i, shot in enumerate(out, 1):
+        shot["id"] = f"s{i:03d}"
+    return out
+
+
 def cut_clip(mv: Path, audio: Path | None, shot: dict, size: tuple[int, int], out: Path):
     """The shot's frames, held on its last frame up to gen_frames, scaled to the generation size, with its sound."""
     a, F, pad = shot["f0"], shot["frames"], shot["gen_frames"] - shot["frames"]

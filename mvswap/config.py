@@ -57,6 +57,7 @@ MIN_SOURCE_SHORT_SIDE = 720      # low-res sources come out soft and smeared; --
 CUT_SCORE = 0.28                 # scene score for an obvious cut
 HIDDEN_CUT_SCORE = 0.12          # second pass inside shots: pink-on-pink cuts the first pass misses
 MAX_ATTEMPTS = 3
+DEFAULT_REF_MODE = "keyframe"     # H3 copies the reference pose; a repainted first frame keeps every second on the source
 SEEDS = [20261024, 777123, 4242]
 
 

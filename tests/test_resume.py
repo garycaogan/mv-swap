@@ -77,6 +77,7 @@ class Fixture(unittest.TestCase):
     def fake_review(self):
         self.stack.enter_context(mock.patch.object(pipeline, "_backdrop_lost", return_value=0))
         self.stack.enter_context(mock.patch.object(pipeline, "_keys", return_value=[]))
+        self.stack.enter_context(mock.patch.object(pipeline.framing, "pairs", return_value=([], [])))
         self.stack.enter_context(mock.patch.object(pipeline.vision, "review_take", return_value={"pass": True, "score": 8}))
 
 
@@ -195,7 +196,8 @@ class VisionCheckpoints(Fixture):
         for a in self.shot["attempts"]:
             a.pop("review")
         self.stack.enter_context(mock.patch.object(pipeline, "_backdrop_lost", return_value=0))
-        self.stack.enter_context(mock.patch.object(pipeline, "_keys", side_effect=lambda job, shot, video, offset, tag: [Path(tag)]))
+        self.stack.enter_context(mock.patch.object(pipeline.framing, "pairs",
+                                                   side_effect=lambda source, take, shot, directory, tag: ([directory], [0])))
         done = Event()
         original_save = self.job.save
 
@@ -204,8 +206,8 @@ class VisionCheckpoints(Fixture):
             if "review" in self.shot["attempts"][1]:
                 done.set()
 
-        def review(cast, people, src, take):
-            if take[0].name == "t1":
+        def review(cast, people, panels, take, seconds=None):
+            if panels[0].name == "s001-1":
                 self.assertTrue(done.wait(5), "the finished review was not checkpointed independently")
                 raise RuntimeError("review call failed")
             return {"pass": True, "score": 8}
@@ -388,12 +390,14 @@ class UpscaleResume(Fixture):
 class ReviewGate(Fixture):
     def run_pipeline(self, accept_failed=False, max_attempts=2):
         # Keep the real generation/review gate, assembly and reporting; bypass completed early stages.
-        names = ("stage_prepare", "stage_shots", "stage_cast", "stage_label", "stage_backdrops", "stage_graphic")
+        names = ("stage_prepare", "stage_shots", "stage_cast", "stage_label", "stage_backdrops", "stage_references", "stage_graphic")
         with ExitStack() as stack:
             for name in names:
                 stack.enter_context(mock.patch.object(pipeline, name))
             stack.enter_context(mock.patch.object(media, "ff"))
             stack.enter_context(mock.patch.object(media, "frame_count", return_value=24))
+            stack.enter_context(mock.patch.object(pipeline.framing, "pairs", return_value=([], [])))
+            stack.enter_context(mock.patch.object(pipeline.framing, "contact_sheet"))
             return pipeline.run(self.job.dir, None, [], max_attempts=max_attempts, accept_failed=accept_failed)
 
     def test_any_failed_shot_blocks_all_upscale_and_accept_resumes_without_new_generation(self):
@@ -498,7 +502,9 @@ class ReviewGate(Fixture):
                                              (1920, 1080, "vstack", "上原片下成片"),
                                              (1080, 1080, "vstack", "上原片下成片")):
             with self.subTest(width=width, height=height), mock.patch.object(media, "ff") as ff, \
-                    mock.patch.object(media, "frame_count", return_value=24):
+                    mock.patch.object(media, "frame_count", return_value=24), \
+                    mock.patch.object(pipeline.framing, "pairs", return_value=([], [])), \
+                    mock.patch.object(pipeline.framing, "contact_sheet"):
                 self.job.state["prepared"].update(width=width, height=height)
                 finish.assemble(self.job.state, self.job.dir)
                 compare = next(c.args for c in ff.call_args_list if c.args[-1].endswith("compare.mp4"))

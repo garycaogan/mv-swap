@@ -46,6 +46,9 @@ def main():
     r.add_argument("--end", type=float)
     r.add_argument("--allow-lowres", action="store_true")
     r.add_argument("--max-attempts", type=int, default=config.MAX_ATTEMPTS)
+    r.add_argument("--ref-mode", choices=("crop", "neutral", "keyframe"), help=f"参考图准备方式，默认 {config.DEFAULT_REF_MODE}；仅新任务使用，续跑沿用")
+    r.add_argument("--refs-only", action="store_true", help="只准备并审查参考图，先目检再原命令续跑 H3")
+    r.add_argument("--max-segment-seconds", type=float, default=0, help="每段原片最长秒数，0 关闭；超长镜头在动作停顿附近切段（新任务）")
     r.add_argument("--crop", default="auto", help="auto（裁掉黑边）/ none / w:h:x:y")
     r.add_argument("--no-upscale", action="store_true", help="不做 SeedVR2 超分")
     r.add_argument("--allow-many-graphic", action="store_true", help="图形镜头超过两成也照做")
@@ -56,8 +59,15 @@ def main():
     a.add_argument("job", type=Path)
     args = ap.parse_args()
     if args.cmd == "run":
+        options = {}
+        if args.ref_mode:
+            options["ref_mode"] = args.ref_mode
+        if args.refs_only:
+            options["refs_only"] = True
+        if args.max_segment_seconds:
+            options["max_segment_seconds"] = args.max_segment_seconds
         pipeline.run(args.job, args.source, args.cast, args.start, args.end, args.allow_lowres, args.max_attempts, args.crop,
-                     not args.no_upscale, args.allow_many_graphic, accept_failed=args.accept_failed)
+                     not args.no_upscale, args.allow_many_graphic, accept_failed=args.accept_failed, **options)
     elif args.cmd == "status":
         status(args.job)
     else:

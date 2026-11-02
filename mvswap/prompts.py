@@ -11,7 +11,8 @@ FRAMING = ("The camera, framing and shot size come from <Video 1>, frame by fram
 SET = "The backdrop, set, lighting and colours are the same as in <Video 1>."
 TEXT = " Any words already written on screen in <Video 1> stay exactly as they are."
 KEEP = ("Maintain the original video's scene, camera movement, composition, lighting, timing, movements, posture, eye direction, "
-        "facial expressions and overall performance unchanged.")
+        "facial expressions and overall performance unchanged. The pictures supply identity and visible clothing only; "
+        "body pose, limb positions and subject scale follow the video at every instant. Keep off-screen body regions off-screen.")
 
 
 def _noun(c):

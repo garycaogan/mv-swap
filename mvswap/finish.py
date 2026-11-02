@@ -3,7 +3,7 @@ import json
 import time
 from pathlib import Path
 
-from . import ai, config, media
+from . import ai, config, framing, media
 
 
 def final_size(width: int, height: int) -> tuple[int, int]:
@@ -98,7 +98,11 @@ def assemble(state: dict, job: Path) -> dict:
     secs = max(1, round(prep["frames"] / config.FPS))
     cols, rows = min(10, secs), min(10, -(-secs // 10))          # a 9-second clip gets one row, not a 10x10 canvas
     media.ff("-i", str(film), "-vf", f"fps=1,scale=192:-2,tile={cols}x{rows}", "-frames:v", "1", str(sheet))
-    return {"film": str(film), "compare": str(side), "sheet": str(sheet), "frames": media.frame_count(film), "want": prep["frames"]}
+    panels, _ = framing.pairs(Path(prep["mv"]), film, {"f0": 0, "frames": prep["frames"]}, out / "seconds", "final", width=256)
+    seconds_sheet = out / "compare-seconds.jpg"
+    framing.contact_sheet(panels, seconds_sheet)
+    return {"film": str(film), "compare": str(side), "sheet": str(sheet), "compare_seconds": str(seconds_sheet),
+            "frames": media.frame_count(film), "want": prep["frames"]}
 
 
 def failed_shots(state: dict) -> list[dict]:
@@ -133,24 +137,32 @@ def report(state: dict, job: Path) -> Path:
     used = sum(next((a.get("cny", 0) for a in s.get("attempts", []) if a["n"] == s.get("chosen")), 0) for s in shots)
     gpu = sum(a.get("run_s", 0) for s in shots for a in s.get("attempts", [])) / 60
     graphic_cny = sum((s.get("graphic") or {}).get("cny", 0) for s in shots)
+    reference_cny = sum(a.get("cny", 0) for s in shots for history in s.get("reference_attempts", {}).values() for a in history)
     up_cny = sum((s.get("upscaled") or {}).get("cny", 0) for s in shots)
     gpu += sum((s.get("upscaled") or {}).get("run_s", 0) for s in shots) / 60
-    wall = (state.get("t_done") or time.time()) - state.get("t_start", time.time())
+    wall = (state.get("t_done") or state.get("t_reference_done") or time.time()) - state.get("t_start", time.time())
     kinds = {k: sum(1 for s in shots if s["kind"] == k) for k in ("swap", "keep", "graphic")}
     flagged = failed_shots(state)
+    preparing_refs = not state.get("final") and (state.get("references_ready") or state.get("reference_blocked"))
+    if preparing_refs:
+        flagged = []
     layout = "上原片下成片" if state["prepared"]["width"] >= state["prepared"]["height"] else "左原片右成片"
     lines = [
         f"# 换人成片报告：{job.name}", "",
-        f"{'诊断用成片' if state.get('review_blocked') else '成片'} `final/film.mp4`，对照 `final/compare.mp4`（{layout}），逐秒缩略图 `final/sheet.jpg`。",
+        ("参考图准备阶段，尚未调用 H3、没有成片。" if preparing_refs else
+         f"{'诊断用成片' if state.get('review_blocked') else '成片'} `final/film.mp4`，对照 `final/compare.mp4`（{layout}），逐秒缩略图 `final/sheet.jpg`。"),
         f"原片 {state['prepared']['width']}×{state['prepared']['height']}，{state['prepared']['frames'] / config.FPS:.1f} 秒，"
         f"{len(shots)} 个镜头：换人 {kinds['swap']}、用原片 {kinds['keep']}、图形 {kinds['graphic']}。", "",
         f"花费：RunningHub 生成 ¥{rh_cny:.2f}（成片用到的 ¥{used:.2f}）、超分 ¥{up_cny:.2f}，图形镜头生图 ¥{graphic_cny:.2f}，"
-        f"视觉模型约 ¥{state.get('vision_cny', 0):.2f}；"
-        f"GPU {gpu:.0f} 分钟；从开始到成片 {wall / 60:.0f} 分钟。", "",
+        f"参考图编辑 ¥{reference_cny:.2f}，视觉模型约 ¥{state.get('vision_cny', 0):.2f}；"
+        f"合计约 ¥{rh_cny + up_cny + graphic_cny + reference_cny + state.get('vision_cny', 0):.2f}；"
+        f"GPU {gpu:.0f} 分钟；{'参考图准备' if preparing_refs else '从开始到成片'} {wall / 60:.0f} 分钟。", "",
     ]
     warn = [c for c in state["cast"] if c.get("src_gender") and c.get("gender") and c["src_gender"] != c["gender"]]
     if warn:
         lines += ["性别对不上的替换（男换女、女换男不稳，留意这些人的镜头）：" + "、".join(f"{c['hint']}→{c['name']}" for c in warn), ""]
+    if state.get("reference_blocked"):
+        lines += ["参考图失败或被接口拒绝，已停止，没有改写提示词绕过。原始错误：", "", "```text", state["reference_blocked"], "```", ""]
     if flagged:
         lines += [f"**{len(flagged)} 个镜头所有版本都没过审**，需要人看：" + "、".join(s["id"] for s in flagged),
                   "片里用的是已完成版本中分数最高的那次；没有可用版本的镜头暂用原片。", ""]
@@ -174,6 +186,25 @@ def report(state: dict, job: Path) -> Path:
         lines.append(f"| {s['id']} | {s['f0'] / config.FPS:.1f}–{(s['f0'] + s['frames']) / config.FPS:.1f} | {s['kind']} | "
                      f"{','.join(s.get('people') or [])} | {len(s.get('attempts', []))} | {s.get('chosen') or '-'} | {rv.get('score', '')} | "
                      f"{(rv.get('issue') or s.get('note') or '').replace('|', '/')[:60]} |")
+    lines += ["", "## 每镜参考图", "", "| 镜头 | 人物 | 原片景别 | H3 参考图 | 来源 / 方法 |", "|---|---|---|---|---|"]
+    for s in shots:
+        for person, ref in (s.get("references") or {}).items():
+            lines.append(f"| {s['id']} | {person} | {ref['framing']} | `{ref['picture']}` | `{ref.get('source', '')}` / {ref['method']} {ref.get('crop_box', '')} |")
+    lines += ["", f"参考图模式：`{state.get('args', {}).get('ref_mode', 'crop')}`。neutral 只输入角色主图生成中性姿势；keyframe 输入原片首帧和角色主图；crop 仅按景别裁图。参考图姿势可能被 H3 照搬。", ""]
+    for s in shots:
+        for person, history in s.get("reference_attempts", {}).items():
+            for a in history:
+                review = a.get("review") or {}
+                lines.append(f"- {s['id']} / {person} 参考图 {a['n']}：`{a['file']}`，任务 `{a.get('task', '-')}`，费用 ¥{a.get('cny',0):.4f}，"
+                             f"{'通过' if review.get('pass') and a.get('manual_pass') is not False else '未通过/未审'}；{review.get('issue') or a.get('error') or ''}")
+                lines.append("  输入：" + "、".join(f"`{p}`" for p in a.get("pictures", [])))
+    lines += ["", "## 逐秒审片", "", "逐秒及每段首尾同帧对照：景别改变一档、机位/姿势不符、回到参考图姿势、原片没露出的下半身出现，任一项直接不过；缺项也不过，总分不覆盖规则。", ""]
+    for s in shots:
+        for a in s.get("attempts", []):
+            rv = a.get("review") or {}
+            lines.append(f"- {s['id']} 版本 {a['n']}：{'通过' if rv.get('pass') else '不过'}，{rv.get('score', '-')} 分；{rv.get('issue') or '无问题'}；证据 `review/{s['id']}-{a['n']}/`。")
+    cap = state.get("args", {}).get("max_segment_seconds", 0)
+    lines += ["", f"每段最长秒数：{cap or '关闭'}；开启后保留原片切镜，超长镜头在动作变化较小处切开。当前 H3 工作流没有独立首帧约束输入，未伪造末帧衔接支持；接缝须看逐秒对照和整片。", ""]
     p = job / "report.md"
     p.write_text("\n".join(lines) + "\n")
     return p
