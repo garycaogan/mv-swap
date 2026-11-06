@@ -22,7 +22,7 @@ python mvswap.py run jobs/apt --source mv.mp4 --start 0 --end 97 \
 1. **Python 3.10+、ffmpeg 5.1 以上**（`brew install ffmpeg` / `apt install ffmpeg`；Ubuntu 22.04 自带的 4.4 太老），然后 `pip install -r requirements.txt`。想直接贴视频链接的话再装 `yt-dlp`。
 2. **两个 key**，复制 `.env.example` 成 `.env` 填上：
    - `RUNNINGHUB_API_KEY`：[RunningHub](https://www.runninghub.cn) 控制台「API 调用」里拿。会员 key 一次跑 5 个任务、扣 RH 币；企业 key 扣钱包、能同时跑很多个，`RUNNINGHUB_CONCURRENCY` 开大。几个 key 用逗号隔开会一起用。
-   - `APIMART_API_KEY`：[APIMart](https://apimart.ai)，认人和审片用它的 Gemini 3.8 Flash，平面图形镜头重画用 GPT Image 2.5。想换别家视觉模型，配 `VISION_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL`（OpenAI 兼容接口都行）。
+   - `APIMART_API_KEY`：[APIMart](https://apimart.ai/register?aff=J2lV)（推荐链接），认人和审片用它的 Gemini 3.8 Flash，平面图形镜头重画用 GPT Image 2.5。想换别家视觉模型，配 `VISION_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL`（OpenAI 兼容接口都行）。
 3. **一条高清原片**：720p 以上，最好 1080p 的本地文件。链接也行（走 yt-dlp），但很多网站游客只给低清，低于 720p 工具会停下；确认就用低清时加 `--allow-lowres`，成片会糊。
 
    ![360p 和 1080p 原片换出来的对比](docs/media/360p-vs-1080p.jpg)
